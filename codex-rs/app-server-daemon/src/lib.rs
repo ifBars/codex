@@ -18,7 +18,6 @@ use codex_app_server_protocol::RemoteControlConnectionStatus;
 use codex_app_server_transport::app_server_control_socket_path;
 use codex_utils_home_dir::find_codex_home;
 use managed_install::managed_codex_bin;
-#[cfg(unix)]
 use managed_install::managed_codex_version;
 use serde::Serialize;
 use settings::DaemonSettings;
@@ -235,15 +234,15 @@ pub async fn run_pid_update_loop() -> Result<()> {
     update_loop::run().await
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ensure_supported_platform() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn ensure_supported_platform() -> Result<()> {
     Err(anyhow!(
-        "codex app-server daemon lifecycle is only supported on Unix platforms"
+        "codex app-server daemon lifecycle is only supported on Unix and Windows platforms"
     ))
 }
 
@@ -592,18 +591,22 @@ impl Daemon {
 
         let backend = backend::pid_backend(self.backend_paths(&settings));
         backend.start().await?;
-        let updater = backend::pid_update_loop_backend(self.backend_paths(&settings));
-        if updater.is_starting_or_running().await? {
-            updater.stop().await?;
+
+        #[cfg(unix)]
+        {
+            let updater = backend::pid_update_loop_backend(self.backend_paths(&settings));
+            if updater.is_starting_or_running().await? {
+                updater.stop().await?;
+            }
+            updater.start().await?;
         }
-        updater.start().await?;
 
         let info = self.wait_until_ready().await?;
         let managed_codex_version = self.managed_codex_version_best_effort().await;
         Ok(BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
-            auto_update_enabled: true,
+            auto_update_enabled: cfg!(unix),
             remote_control_enabled: settings.remote_control_enabled,
             managed_codex_path: self.managed_codex_bin.clone(),
             managed_codex_version,
@@ -666,14 +669,8 @@ impl Daemon {
         ))
     }
 
-    #[cfg(unix)]
     async fn managed_codex_version_best_effort(&self) -> Option<String> {
         managed_codex_version(&self.managed_codex_bin).await.ok()
-    }
-
-    #[cfg(not(unix))]
-    async fn managed_codex_version_best_effort(&self) -> Option<String> {
-        None
     }
 
     fn backend_paths(&self, settings: &DaemonSettings) -> BackendPaths {
