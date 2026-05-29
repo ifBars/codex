@@ -10,9 +10,15 @@ machines that should expose app-server with `remote_control` enabled.
 
 ## Platform support
 
-The current daemon implementation is Unix-only. It uses pidfile-backed
-daemonization plus Unix process and file-locking primitives, and does not yet
-support Windows lifecycle management.
+The daemon implementation supports Unix and Windows lifecycle management.
+Unix uses pidfile-backed daemonization plus Unix process and file-locking
+primitives. Windows uses the same pidfile state model with Win32 process
+liveness, termination, and file-locking primitives.
+
+The detached updater loop remains Unix-only. On Windows, `bootstrap` and
+top-level `codex remote-control start` can start a managed app-server with
+remote control enabled, but they report `autoUpdateEnabled: false` and do not
+launch the standalone updater process.
 
 ## Commands
 
