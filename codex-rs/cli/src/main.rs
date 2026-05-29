@@ -173,6 +173,12 @@ enum Subcommand {
     /// Resume a previous interactive session (picker by default; use --last to continue the most recent).
     Resume(ResumeCommand),
 
+    /// Archive a saved session by id or thread name.
+    Archive(ThreadArchiveCommand),
+
+    /// Unarchive a saved session by id or thread name.
+    Unarchive(ThreadArchiveCommand),
+
     /// Fork a previous interactive session (picker by default; use --last to fork the most recent).
     Fork(ForkCommand),
 
@@ -316,6 +322,13 @@ struct ResumeCommand {
 
     #[clap(flatten)]
     config_overrides: TuiCli,
+}
+
+#[derive(Debug, Parser)]
+struct ThreadArchiveCommand {
+    /// Conversation/session id (UUID) or thread name. UUIDs take precedence if it parses.
+    #[arg(value_name = "THREAD")]
+    target: String,
 }
 
 #[derive(Debug, Parser)]
@@ -734,6 +747,31 @@ fn run_execpolicycheck(cmd: ExecPolicyCheckCommand) -> anyhow::Result<()> {
     cmd.run()
 }
 
+async fn run_thread_archive_cli_command(
+    action: codex_tui::ThreadArchiveAction,
+    cmd: ThreadArchiveCommand,
+    mut interactive: TuiCli,
+    root_config_overrides: CliConfigOverrides,
+    remote: Option<String>,
+    remote_auth_token_env: Option<String>,
+    arg0_paths: Arg0DispatchPaths,
+) -> anyhow::Result<codex_tui::ThreadArchiveCommandOutput> {
+    prepend_config_flags(&mut interactive.config_overrides, root_config_overrides);
+    let explicit_remote_endpoint = resolve_remote_endpoint(remote, remote_auth_token_env)?;
+    codex_tui::run_thread_archive_command(
+        action,
+        cmd.target,
+        codex_tui::ThreadArchiveCommandOptions {
+            cli: interactive,
+            arg0_paths,
+            loader_overrides: codex_config::LoaderOverrides::default(),
+            explicit_remote_endpoint,
+        },
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("{err}"))
+}
+
 async fn run_debug_app_server_command(cmd: DebugAppServerCommand) -> anyhow::Result<()> {
     match cmd.subcommand {
         DebugAppServerSubcommand::SendMessageV2(cmd) => {
@@ -1124,6 +1162,32 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             .await?;
             handle_app_exit(exit_info)?;
         }
+        Some(Subcommand::Archive(cmd)) => {
+            let output = run_thread_archive_cli_command(
+                codex_tui::ThreadArchiveAction::Archive,
+                cmd,
+                interactive,
+                root_config_overrides.clone(),
+                root_remote.clone(),
+                root_remote_auth_token_env.clone(),
+                arg0_paths.clone(),
+            )
+            .await?;
+            println!("{}", output.success_message());
+        }
+        Some(Subcommand::Unarchive(cmd)) => {
+            let output = run_thread_archive_cli_command(
+                codex_tui::ThreadArchiveAction::Unarchive,
+                cmd,
+                interactive,
+                root_config_overrides.clone(),
+                root_remote.clone(),
+                root_remote_auth_token_env.clone(),
+                arg0_paths.clone(),
+            )
+            .await?;
+            println!("{}", output.success_message());
+        }
         Some(Subcommand::Fork(ForkCommand {
             session_id,
             last,
@@ -1463,6 +1527,8 @@ fn profile_v2_for_subcommand<'a>(
         Subcommand::Exec(_)
         | Subcommand::Review(_)
         | Subcommand::Resume(_)
+        | Subcommand::Archive(_)
+        | Subcommand::Unarchive(_)
         | Subcommand::Fork(_)
         | Subcommand::Mcp(_)
         | Subcommand::Sandbox(_)
@@ -1470,7 +1536,7 @@ fn profile_v2_for_subcommand<'a>(
             subcommand: DebugSubcommand::PromptInput(_),
         }) => Ok(Some(profile_v2)),
         _ => anyhow::bail!(
-            "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex resume`, `codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`."
+            "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex resume`, `codex archive`, `codex unarchive`, `codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`."
         ),
     }
 }
@@ -1890,6 +1956,8 @@ fn unsupported_subcommand_name_for_strict_config(
         | Some(Subcommand::McpServer(_))
         | Some(Subcommand::ExecServer(_))
         | Some(Subcommand::Resume(_))
+        | Some(Subcommand::Archive(_))
+        | Some(Subcommand::Unarchive(_))
         | Some(Subcommand::Fork(_))
         | Some(Subcommand::Doctor(_)) => None,
         Some(Subcommand::AppServer(app_server)) if app_server.subcommand.is_none() => None,
@@ -2037,34 +2105,13 @@ async fn run_interactive_tui(
         }
     }
 
-    let mut remote_endpoint = remote
-        .as_deref()
-        .map(codex_tui::resolve_remote_addr)
-        .transpose()
-        .map_err(std::io::Error::other)?;
-    if let Some(remote_auth_token_env) = remote_auth_token_env {
-        let Some(endpoint) = remote_endpoint.as_mut() else {
-            return Ok(AppExitInfo::fatal(
-                "`--remote-auth-token-env` requires `--remote`.",
-            ));
-        };
-        if !codex_tui::remote_addr_supports_auth_token(endpoint) {
-            return Ok(AppExitInfo::fatal(
-                "`--remote-auth-token-env` requires a `wss://` or loopback `ws://` remote.",
-            ));
+    let remote_endpoint = match resolve_remote_endpoint(remote, remote_auth_token_env) {
+        Ok(remote_endpoint) => remote_endpoint,
+        Err(err) if is_remote_auth_usage_error(&err) => {
+            return Ok(AppExitInfo::fatal(err.to_string()));
         }
-        let auth_token = read_remote_auth_token_from_env_var(&remote_auth_token_env)
-            .map_err(std::io::Error::other)?;
-        let codex_tui::RemoteAppServerEndpoint::WebSocket {
-            auth_token: slot, ..
-        } = endpoint
-        else {
-            return Ok(AppExitInfo::fatal(
-                "`--remote-auth-token-env` requires a `wss://` or loopback `ws://` remote.",
-            ));
-        };
-        *slot = Some(auth_token);
-    }
+        Err(err) => return Err(err),
+    };
     let start_tui = || {
         codex_tui::run_main(
             interactive.clone(),
@@ -2106,6 +2153,46 @@ async fn run_interactive_tui(
         }
         attempted_repair = true;
     }
+}
+
+fn resolve_remote_endpoint(
+    remote: Option<String>,
+    remote_auth_token_env: Option<String>,
+) -> std::io::Result<Option<codex_tui::RemoteAppServerEndpoint>> {
+    let mut remote_endpoint = remote
+        .as_deref()
+        .map(codex_tui::resolve_remote_addr)
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    if let Some(remote_auth_token_env) = remote_auth_token_env {
+        let Some(endpoint) = remote_endpoint.as_mut() else {
+            return Err(std::io::Error::other(
+                "`--remote-auth-token-env` requires `--remote`.",
+            ));
+        };
+        if !codex_tui::remote_addr_supports_auth_token(endpoint) {
+            return Err(std::io::Error::other(
+                "`--remote-auth-token-env` requires a `wss://` or loopback `ws://` remote.",
+            ));
+        }
+        let auth_token = read_remote_auth_token_from_env_var(&remote_auth_token_env)
+            .map_err(std::io::Error::other)?;
+        let codex_tui::RemoteAppServerEndpoint::WebSocket {
+            auth_token: slot, ..
+        } = endpoint
+        else {
+            return Err(std::io::Error::other(
+                "`--remote-auth-token-env` requires a `wss://` or loopback `ws://` remote.",
+            ));
+        };
+        *slot = Some(auth_token);
+    }
+    Ok(remote_endpoint)
+}
+
+fn is_remote_auth_usage_error(err: &std::io::Error) -> bool {
+    err.to_string()
+        .starts_with("`--remote-auth-token-env` requires")
 }
 
 fn confirm(prompt: &str) -> std::io::Result<bool> {
@@ -2603,6 +2690,26 @@ mod tests {
     fn update_parses_as_update_subcommand() {
         let cli = MultitoolCli::try_parse_from(["codex", "update"]).expect("parse");
         assert!(matches!(cli.subcommand, Some(Subcommand::Update)));
+    }
+
+    #[test]
+    fn archive_parses_target() {
+        let cli = MultitoolCli::try_parse_from(["codex", "archive", "my-thread"]).expect("parse");
+        let Some(Subcommand::Archive(command)) = cli.subcommand else {
+            panic!("expected archive command");
+        };
+
+        assert_eq!(command.target, "my-thread");
+    }
+
+    #[test]
+    fn unarchive_parses_target() {
+        let cli = MultitoolCli::try_parse_from(["codex", "unarchive", "my-thread"]).expect("parse");
+        let Some(Subcommand::Unarchive(command)) = cli.subcommand else {
+            panic!("expected unarchive command");
+        };
+
+        assert_eq!(command.target, "my-thread");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]

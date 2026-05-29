@@ -164,6 +164,9 @@ impl ChatWidget {
             SlashCommand::New => {
                 self.app_event_tx.send(AppEvent::NewSession);
             }
+            SlashCommand::Archive => {
+                self.app_event_tx.send(AppEvent::ArchiveCurrentThread);
+            }
             SlashCommand::Clear => {
                 self.app_event_tx.send(AppEvent::ClearUi);
             }
@@ -949,6 +952,7 @@ impl ChatWidget {
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Feedback
             | SlashCommand::New
+            | SlashCommand::Archive
             | SlashCommand::Clear
             | SlashCommand::Resume
             | SlashCommand::Fork

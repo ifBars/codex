@@ -5107,6 +5107,85 @@ async fn shutdown_first_exit_uses_app_server_shutdown_without_submitting_op() {
 }
 
 #[tokio::test]
+async fn archive_current_thread_exits_without_starting_fresh_session() {
+    let (mut app, mut app_event_rx, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+        app.chat_widget.config_ref(),
+    ))
+    .await
+    .expect("embedded app server");
+    let thread_id = ThreadId::new();
+    let timestamp = "2025-01-02T10:00:00Z";
+    let filename_ts = "2025-01-02T10-00-00";
+    let config = app.chat_widget.config_ref();
+    let rollout_path = config
+        .codex_home
+        .join("sessions/2025/01/02")
+        .join(format!("rollout-{filename_ts}-{thread_id}.jsonl"));
+    std::fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
+        .expect("rollout directory should be created");
+    let session_meta = codex_protocol::protocol::SessionMeta {
+        id: thread_id,
+        timestamp: timestamp.to_string(),
+        cwd: config.cwd.to_path_buf(),
+        originator: "codex".to_string(),
+        cli_version: "0.0.0".to_string(),
+        source: codex_protocol::protocol::SessionSource::Cli,
+        model_provider: Some(config.model_provider_id.clone()),
+        ..Default::default()
+    };
+    let session_meta = serde_json::to_value(codex_protocol::protocol::SessionMetaLine {
+        meta: session_meta,
+        git: None,
+    })
+    .expect("session meta should serialize");
+    std::fs::write(
+        &rollout_path,
+        [
+            serde_json::json!({
+                "timestamp": timestamp,
+                "type": "session_meta",
+                "payload": session_meta,
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "materialized thread",
+                    "kind": "plain",
+                },
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .expect("rollout should be written");
+    app.active_thread_id = Some(thread_id);
+
+    let control = Box::pin(app.archive_current_thread(&mut app_server)).await;
+
+    assert!(matches!(
+        control,
+        AppRunControl::Exit(ExitReason::UserRequested)
+    ));
+    app_server
+        .thread_unarchive(thread_id)
+        .await
+        .expect("thread should have been archived");
+    assert!(
+        app_event_rx.try_recv().is_err(),
+        "archive should not request a new session"
+    );
+    assert!(
+        op_rx.try_recv().is_err(),
+        "archive should not submit Op::Shutdown"
+    );
+}
+
+#[tokio::test]
 async fn interrupt_without_active_turn_is_treated_as_handled() {
     Box::pin(async {
         let mut app = make_test_app().await;
